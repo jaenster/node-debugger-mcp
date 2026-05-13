@@ -136,6 +136,50 @@ export function registerExecutionTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "debug_wait_for_any_pause",
+    {
+      title: "debug_wait_for_any_pause",
+      description:
+        "Wait for ANY session (or any of the named sessions) to pause. Returns { sessionId, pause } for the first one that pauses. Useful when a parent process (e.g. `node --test`) spawns subprocess(es) where the actual interesting pauses happen.",
+      inputSchema: {
+        sessionIds: z.array(z.string()).optional().describe("Restrict to specific sessions; default = all current sessions."),
+        timeoutMs: z.number().int().positive().optional().default(15000),
+      },
+    },
+    async ({ sessionIds, timeoutMs }) => {
+      // Snapshot the candidate set up front. New auto-sessions that appear
+      // mid-wait will be picked up by our re-poll loop below — keeps this
+      // honest about which sessions could matter.
+      const targets = (sessionIds && sessionIds.length > 0)
+        ? sessionIds.map((id) => sessions.get(id)).filter((s): s is NonNullable<typeof s> => !!s)
+        : sessions.list();
+
+      // Cheap: any already-paused?
+      for (const s of targets) {
+        if (s.pauseState) {
+          return asToolResult({ sessionId: s.id, status: "paused", pause: s.pauseState });
+        }
+      }
+
+      const deadline = Date.now() + (timeoutMs ?? 15000);
+      // Re-poll every 100ms; cheap because pauseState is just a memory check.
+      // Auto-sessions spawned after we started are included in each iteration.
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+        const current = (sessionIds && sessionIds.length > 0)
+          ? sessionIds.map((id) => sessions.get(id)).filter((s): s is NonNullable<typeof s> => !!s)
+          : sessions.list();
+        for (const s of current) {
+          if (s.pauseState) {
+            return asToolResult({ sessionId: s.id, status: "paused", pause: s.pauseState });
+          }
+        }
+      }
+      return asToolResult({ status: "running" });
+    },
+  );
+
+  server.registerTool(
     "debug_wait_for_pause",
     {
       title: "debug_wait_for_pause",

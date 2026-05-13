@@ -104,6 +104,13 @@ export interface LaunchOptions {
   followChildren?: "off" | "noBreak" | "break";
   /** If true, the bootstrap shim registers process.on("unhandledRejection") → debugger; in the main thread of every Node descendant. */
   pauseOnUnhandledRejection?: boolean;
+  /**
+   * Apply pause-on-exceptions BEFORE the target resumes from --inspect-brk.
+   * Needed to catch exceptions that fire during fast startup paths (e.g.
+   * `node --test`'s assertion failures) that would otherwise race ahead of
+   * a post-launch setExceptionPause call.
+   */
+  exceptionPause?: { state: ExceptionPauseState; filter?: string[] };
 }
 
 export interface AttachOptions {
@@ -282,11 +289,27 @@ export class Session {
 
     session.cdp = await connectToWsUrl(wsUrl);
     await session.setupRoot();
+
+    // Apply exception-pause BEFORE the target executes any user code. Without
+    // this, fast startup paths (e.g. `node --test`'s assertion failures) race
+    // ahead of any post-launch setExceptionPause call.
+    if (opts.exceptionPause && opts.exceptionPause.state !== "none") {
+      await session.setExceptionPause({
+        state: opts.exceptionPause.state,
+        filter: opts.exceptionPause.filter,
+      });
+    }
+
     await session.runIfWaitingForDebugger();
 
-    if (opts.stopOnEntry === false) {
+    // "Resume past Break on start" only applies when we actually launched
+    // with --inspect-brk (the `script` mode). In `command` mode we use
+    // --inspect=0 so there's no entry pause — and blindly resuming past
+    // whatever first pause arrives (which might be a meaningful one like
+    // an exception) is wrong.
+    if (opts.stopOnEntry === false && opts.script) {
       const entry = await session.waitForNextPause(2000);
-      if (entry) {
+      if (entry && entry.reason === "Break on start") {
         await session.cdp.Debugger.resume({});
       }
     }
@@ -306,6 +329,19 @@ export class Session {
     session.cdp = await connectToWsUrl(wsUrl);
     await session.setupRoot();
     await session.runIfWaitingForDebugger();
+    // Inherit parent's exception-pause state so e.g. `debug_run_tests`'s
+    // AssertionError filter applies in the subprocess where `node --test`
+    // actually runs the test file.
+    if (parent.exceptionPause !== "none") {
+      try {
+        await session.setExceptionPause({
+          state: parent.exceptionPause,
+          filter: parent.exceptionFilter ?? undefined,
+        });
+      } catch (e) {
+        log.debug(`failed to inherit exception pause into auto-session ${id}: ${String(e)}`);
+      }
+    }
     parent.childSessionIds.add(id);
     return session;
   }
@@ -466,7 +502,6 @@ export class Session {
         log.debug(
           `session ${this.id} auto-resuming filtered ${className} (not in [${this.exceptionFilter.join(",")}])`,
         );
-        // Fire-and-forget resume. Errors are logged inside CDP.
         this.cdp.Debugger.resume({}).catch(() => {});
         return;
       }
@@ -588,7 +623,7 @@ export class Session {
       }
     }
 
-    log.debug(`session ${this.id} paused: ${e.reason}`);
+    log.debug(`session ${this.id} paused: reason=${e.reason} frames=${e.callFrames.length}`);
 
     // Resolve any in-flight wait.
     if (this.pendingPause) {
@@ -1302,6 +1337,332 @@ export class Session {
       instances.push(flat);
     }
     return { count: instances.length, instances };
+  }
+
+  // -- CPU profile ------------------------------------------------------
+
+  /**
+   * Run a CPU profile for `durationMs` and return the top-N hottest
+   * functions by self-time. Uses Profiler.start / Profiler.stop and
+   * processes the returned tree client-side.
+   */
+  async cpuProfile(opts: {
+    durationMs: number;
+    topN?: number;
+    includeNodeInternals?: boolean;
+  }): Promise<{
+    durationMs: number;
+    totalSamples: number;
+    topByTotal: Array<{ functionName: string; url: string; line: number; samples: number }>;
+  }> {
+    await this.cdp.Profiler.enable();
+    await this.cdp.Profiler.start();
+    await new Promise((r) => setTimeout(r, opts.durationMs));
+    const res = (await this.cdp.Profiler.stop()) as {
+      profile: {
+        nodes: Array<{
+          id: number;
+          callFrame: { functionName: string; url: string; lineNumber: number };
+          hitCount?: number;
+          children?: number[];
+        }>;
+        samples?: number[];
+      };
+    };
+    await this.cdp.Profiler.disable();
+
+    // Aggregate by callFrame signature. Each sample's leaf is the function
+    // currently executing; we count samples per node to estimate self-time.
+    const nodeById = new Map<number, (typeof res.profile.nodes)[0]>();
+    for (const n of res.profile.nodes) nodeById.set(n.id, n);
+
+    const samples = res.profile.samples ?? [];
+    const counts = new Map<number, number>(); // node id → leaf-sample count
+    for (const s of samples) counts.set(s, (counts.get(s) ?? 0) + 1);
+
+    type Row = { functionName: string; url: string; line: number; samples: number };
+    const rows: Row[] = [];
+    for (const [id, count] of counts.entries()) {
+      const n = nodeById.get(id);
+      if (!n) continue;
+      if (!opts.includeNodeInternals && isInternalUrl(n.callFrame.url)) continue;
+      rows.push({
+        functionName: n.callFrame.functionName || "<anonymous>",
+        url: n.callFrame.url,
+        line: n.callFrame.lineNumber,
+        samples: count,
+      });
+    }
+    rows.sort((a, b) => b.samples - a.samples);
+    const topN = opts.topN ?? 20;
+    return {
+      durationMs: opts.durationMs,
+      totalSamples: samples.length,
+      topByTotal: rows.slice(0, topN),
+    };
+  }
+
+  // -- Heap snapshot ----------------------------------------------------
+
+  /**
+   * Capture a heap snapshot, write it to disk (the full thing is too big
+   * to return as a tool response), and compute a class-level summary.
+   * The .heapsnapshot file is openable in Chrome DevTools → Memory.
+   */
+  async heapSnapshot(opts: { savePath?: string }): Promise<{
+    path: string;
+    sizeBytes: number;
+    nodeCount: number;
+    topByCount: Array<{ name: string; count: number; selfSize: number }>;
+  }> {
+    const path = opts.savePath ?? `/tmp/ndb-heap-${this.id}-${Date.now()}.heapsnapshot`;
+    const { writeFileSync } = await import("node:fs");
+
+    const chunks: string[] = [];
+    const onChunk = (event: unknown) => {
+      const e = event as { chunk: string };
+      chunks.push(e.chunk);
+    };
+    this.cdp.on("HeapProfiler.addHeapSnapshotChunk", onChunk);
+
+    await this.cdp.HeapProfiler.enable();
+    await this.cdp.HeapProfiler.takeHeapSnapshot({ reportProgress: false });
+    // Give the last chunk events a tick to arrive.
+    await new Promise((r) => setImmediate(r));
+    this.cdp.removeListener("HeapProfiler.addHeapSnapshotChunk", onChunk);
+    await this.cdp.HeapProfiler.disable();
+
+    const raw = chunks.join("");
+    writeFileSync(path, raw, "utf8");
+
+    // Parse the snapshot JSON enough to summarise. Format docs:
+    // https://developer.chrome.com/docs/devtools/memory-problems/heap-snapshot-schema
+    const parsed = JSON.parse(raw) as {
+      snapshot: { node_count: number; meta: { node_fields: string[]; node_types: Array<string | string[]> } };
+      nodes: number[];
+      strings: string[];
+    };
+    const fields = parsed.snapshot.meta.node_fields;
+    const fieldCount = fields.length;
+    const nameIdx = fields.indexOf("name");
+    const typeIdx = fields.indexOf("type");
+    const selfSizeIdx = fields.indexOf("self_size");
+    const nodeTypeEnum = parsed.snapshot.meta.node_types[typeIdx];
+    const typeNames = Array.isArray(nodeTypeEnum) ? nodeTypeEnum : [];
+
+    const tally = new Map<string, { count: number; selfSize: number }>();
+    const nodes = parsed.nodes;
+    for (let i = 0; i < nodes.length; i += fieldCount) {
+      const typeId = nodes[i + typeIdx];
+      const name = parsed.strings[nodes[i + nameIdx]!] ?? "?";
+      const selfSize = nodes[i + selfSizeIdx]!;
+      const className = typeNames[typeId!] === "object" ? name : (typeNames[typeId!] ?? "?");
+      const entry = tally.get(className) ?? { count: 0, selfSize: 0 };
+      entry.count += 1;
+      entry.selfSize += selfSize;
+      tally.set(className, entry);
+    }
+    const topByCount = Array.from(tally.entries())
+      .map(([name, v]) => ({ name, count: v.count, selfSize: v.selfSize }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 20);
+
+    return {
+      path,
+      sizeBytes: raw.length,
+      nodeCount: parsed.snapshot.node_count,
+      topByCount,
+    };
+  }
+
+  // -- Profiler-based execution trace -----------------------------------
+  private traceActive = false;
+
+  async startExecutionTrace(): Promise<void> {
+    if (this.traceActive) return;
+    await this.cdp.Profiler.enable();
+    await this.cdp.Profiler.startPreciseCoverage({ callCount: true, detailed: true });
+    this.traceActive = true;
+  }
+
+  async stopExecutionTrace(opts: {
+    topN?: number;
+    urlFilter?: string;
+    includeNodeInternals?: boolean;
+  }): Promise<{
+    totalFunctions: number;
+    functions: Array<{
+      url: string;
+      functionName: string;
+      startOffset: number;
+      endOffset: number;
+      count: number;
+    }>;
+  }> {
+    if (!this.traceActive) {
+      return { totalFunctions: 0, functions: [] };
+    }
+    const cov = (await this.cdp.Profiler.takePreciseCoverage()) as {
+      result: Array<{
+        scriptId: string;
+        url: string;
+        functions: Array<{
+          functionName: string;
+          ranges: Array<{ startOffset: number; endOffset: number; count: number }>;
+        }>;
+      }>;
+    };
+    await this.cdp.Profiler.stopPreciseCoverage();
+    await this.cdp.Profiler.disable();
+    this.traceActive = false;
+
+    const include = !!opts.includeNodeInternals;
+    const filter = opts.urlFilter;
+    const flat: Array<{
+      url: string;
+      functionName: string;
+      startOffset: number;
+      endOffset: number;
+      count: number;
+    }> = [];
+    for (const script of cov.result) {
+      if (!include && isInternalUrl(script.url)) continue;
+      if (filter && !script.url.includes(filter)) continue;
+      for (const fn of script.functions) {
+        // The first range covers the full function body; its count is the
+        // function's invocation count.
+        const top = fn.ranges[0];
+        if (!top || top.count === 0) continue;
+        flat.push({
+          url: script.url,
+          functionName: fn.functionName || "<anonymous>",
+          startOffset: top.startOffset,
+          endOffset: top.endOffset,
+          count: top.count,
+        });
+      }
+    }
+    flat.sort((a, b) => b.count - a.count);
+    const topN = opts.topN ?? 50;
+    return { totalFunctions: flat.length, functions: flat.slice(0, topN) };
+  }
+
+  /**
+   * Snapshot what's currently holding the Node event loop open.
+   * Uses process._getActiveHandles() / _getActiveRequests() (private but
+   * stable APIs) — the same data `node --trace-exit` shows. Useful for
+   * "why won't this script exit" and "what's pending."
+   */
+  async getEventLoopStatus(): Promise<
+    | { error: string }
+    | {
+        uptime: number;
+        eventLoopUtilization: number;
+        handles: Array<{ index: number; type: string; summary?: string; localObjectId?: string }>;
+        requests: Array<{ index: number; type: string; summary?: string; localObjectId?: string }>;
+      }
+  > {
+    const expr = `(() => {
+      const out = { uptime: process.uptime(), handles: [], requests: [], eventLoopUtilization: 0 };
+      try {
+        const perf = require('node:perf_hooks');
+        const elu = perf.performance.eventLoopUtilization();
+        out.eventLoopUtilization = elu.utilization;
+      } catch (e) {}
+      try {
+        for (const [i, h] of process._getActiveHandles().entries()) {
+          const t = h && h.constructor ? h.constructor.name : typeof h;
+          const summary = (() => {
+            try {
+              if (t === "Timeout") return "after " + (h._idleTimeout || h._repeat || "?") + "ms";
+              if (t === "Socket" || t === "TLSSocket") return (h.remoteAddress || "?") + ":" + (h.remotePort || "?");
+              if (t === "Server") return "listening " + (h.address && JSON.stringify(h.address()));
+              if (t === "ReadStream" || t === "WriteStream") return h.path || h.fd;
+              if (t === "ChildProcess") return "pid " + h.pid;
+              return undefined;
+            } catch (e) { return undefined; }
+          })();
+          out.handles.push({ index: i, type: t, summary, ref: h });
+        }
+      } catch (e) {}
+      try {
+        for (const [i, r] of process._getActiveRequests().entries()) {
+          const t = r && r.constructor ? r.constructor.name : typeof r;
+          out.requests.push({ index: i, type: t, ref: r });
+        }
+      } catch (e) {}
+      return out;
+    })()`;
+
+    const res = (await this.cdp.Runtime.evaluate({
+      expression: expr,
+      returnByValue: false,
+      generatePreview: false,
+    })) as { result: RemoteObjectLike; exceptionDetails?: { text: string } };
+
+    if (res.exceptionDetails) return { error: res.exceptionDetails.text };
+    if (!res.result.objectId) return { error: "evaluation did not return an object" };
+
+    // Walk the result object's properties to extract the structured fields.
+    const top = (await this.cdp.Runtime.getProperties({
+      objectId: res.result.objectId,
+      ownProperties: true,
+    })) as { result: Array<{ name: string; value?: RemoteObjectLike }> };
+
+    let uptime = 0;
+    let elu = 0;
+    let handlesObjId: string | undefined;
+    let requestsObjId: string | undefined;
+    for (const p of top.result) {
+      if (p.name === "uptime") uptime = Number(p.value?.value ?? 0);
+      else if (p.name === "eventLoopUtilization") elu = Number(p.value?.value ?? 0);
+      else if (p.name === "handles") handlesObjId = p.value?.objectId;
+      else if (p.name === "requests") requestsObjId = p.value?.objectId;
+    }
+
+    const expandArray = async (
+      arrayId: string | undefined,
+    ): Promise<Array<{ index: number; type: string; summary?: string; localObjectId?: string }>> => {
+      if (!arrayId) return [];
+      const arr = (await this.cdp.Runtime.getProperties({
+        objectId: arrayId,
+        ownProperties: true,
+      })) as { result: Array<{ name: string; value?: RemoteObjectLike }> };
+      const out: Array<{ index: number; type: string; summary?: string; localObjectId?: string }> = [];
+      for (const entry of arr.result) {
+        if (!/^\d+$/.test(entry.name)) continue;
+        const v = entry.value;
+        if (!v || v.type !== "object" || !v.objectId) continue;
+        const inner = (await this.cdp.Runtime.getProperties({
+          objectId: v.objectId,
+          ownProperties: true,
+        })) as { result: Array<{ name: string; value?: RemoteObjectLike }> };
+        let index = -1;
+        let type = "?";
+        let summary: string | undefined;
+        let refId: string | undefined;
+        for (const ip of inner.result) {
+          if (ip.name === "index") index = Number(ip.value?.value ?? -1);
+          else if (ip.name === "type") type = String(ip.value?.value ?? "?");
+          else if (ip.name === "summary" && ip.value?.value !== undefined) summary = String(ip.value.value);
+          else if (ip.name === "ref" && ip.value?.objectId) refId = ip.value.objectId;
+        }
+        out.push({
+          index,
+          type,
+          ...(summary ? { summary } : {}),
+          ...(refId ? { localObjectId: this.objects.mint(refId) } : {}),
+        });
+      }
+      return out;
+    };
+
+    return {
+      uptime,
+      eventLoopUtilization: elu,
+      handles: await expandArray(handlesObjId),
+      requests: await expandArray(requestsObjId),
+    };
   }
 
   listScripts(opts: { includeNodeInternals?: boolean; urlFilter?: string }): {

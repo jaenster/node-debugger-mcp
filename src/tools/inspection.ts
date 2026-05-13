@@ -170,6 +170,103 @@ export function registerInspectionTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "debug_cpu_profile",
+    {
+      title: "debug_cpu_profile",
+      description:
+        "Record a CPU profile for `durationMs` and return the top-N hottest functions by sample count (≈ self-time). The full profile is processed server-side so the response stays small. Use to answer 'why is this slow?' Cost: ~0 — V8's sampling profiler is cheap.",
+      inputSchema: {
+        sessionId: z.string().optional(),
+        durationMs: z.number().int().positive().default(2000),
+        topN: z.number().int().positive().optional().default(20),
+        includeNodeInternals: z.boolean().optional().default(false),
+      },
+    },
+    async ({ sessionId, durationMs, topN, includeNodeInternals }) => {
+      const session = sessions.resolve(sessionId);
+      if (!session) return asToolResult({ error: "no such session" });
+      const res = await session.cpuProfile({ durationMs, topN, includeNodeInternals });
+      return asToolResult(res);
+    },
+  );
+
+  server.registerTool(
+    "debug_heap_snapshot",
+    {
+      title: "debug_heap_snapshot",
+      description:
+        "Take a V8 heap snapshot and write it to disk (defaults to /tmp/ndb-heap-<session>-<ts>.heapsnapshot). The full snapshot is too big to return inline — load the file in Chrome DevTools → Memory tab for the full retainer-path UI. Returns the file path + a class-level summary (top-N classes by instance count + their total self-size).",
+      inputSchema: {
+        sessionId: z.string().optional(),
+        savePath: z.string().optional(),
+      },
+    },
+    async ({ sessionId, savePath }) => {
+      const session = sessions.resolve(sessionId);
+      if (!session) return asToolResult({ error: "no such session" });
+      const res = await session.heapSnapshot({ savePath });
+      return asToolResult(res);
+    },
+  );
+
+  server.registerTool(
+    "debug_trace_start",
+    {
+      title: "debug_trace_start",
+      description:
+        "Start a function-execution trace using V8's precise coverage profiler. Cheap (~no overhead) — records which functions get called, how many times. Stop with debug_trace_stop to get the ranked list. Useful for 'what actually ran when this happens' on unfamiliar code.",
+      inputSchema: {
+        sessionId: z.string().optional(),
+      },
+    },
+    async ({ sessionId }) => {
+      const session = sessions.resolve(sessionId);
+      if (!session) return asToolResult({ error: "no such session" });
+      await session.startExecutionTrace();
+      return asToolResult({ tracing: true });
+    },
+  );
+
+  server.registerTool(
+    "debug_trace_stop",
+    {
+      title: "debug_trace_stop",
+      description:
+        "Stop the function-execution trace started by debug_trace_start. Returns the top-N functions ranked by invocation count (default top 50), filtered to non-node-internal scripts by default. Each entry includes the script URL, function name, call count, and start/end character offsets (use debug_get_source for the surrounding lines).",
+      inputSchema: {
+        sessionId: z.string().optional(),
+        topN: z.number().int().positive().optional().default(50),
+        urlFilter: z.string().optional(),
+        includeNodeInternals: z.boolean().optional().default(false),
+      },
+    },
+    async ({ sessionId, topN, urlFilter, includeNodeInternals }) => {
+      const session = sessions.resolve(sessionId);
+      if (!session) return asToolResult({ error: "no such session" });
+      const res = await session.stopExecutionTrace({ topN, urlFilter, includeNodeInternals });
+      return asToolResult(res);
+    },
+  );
+
+  server.registerTool(
+    "debug_event_loop_status",
+    {
+      title: "debug_event_loop_status",
+      description:
+        "Snapshot of what's currently holding the Node event loop open. Returns active handles (timers, sockets, file descriptors, child processes, servers, intervals) and active requests (in-flight async ops), plus uptime and event-loop utilization. Each handle/request has a `localObjectId` so you can drill into it with debug_get_properties. Use this when a script won't exit or for diagnosing event-loop holds.",
+      inputSchema: {
+        sessionId: z.string().optional(),
+      },
+    },
+    async ({ sessionId }) => {
+      const session = sessions.resolve(sessionId);
+      if (!session) return asToolResult({ error: "no such session" });
+      const res = await session.getEventLoopStatus();
+      return asToolResult(res);
+    },
+  );
+
+  server.registerTool(
     "debug_get_async_context",
     {
       title: "debug_get_async_context",

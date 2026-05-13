@@ -76,6 +76,68 @@ export function registerSessionTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "debug_run_tests",
+    {
+      title: "debug_run_tests",
+      description:
+        "Launch `node --test [pattern...]` under the debugger. Equivalent to debug_launch with command:['node','--test',...] plus convenience setup: when pauseOnFailure=true (default), pre-installs an exception breakpoint filtered to AssertionError so any `assert.*` failure pauses execution at the throw site. Use with node:test (Node's built-in test runner). For Jest/Vitest, use debug_launch with the appropriate command instead.",
+      inputSchema: {
+        pattern: z.array(z.string()).optional().describe("File patterns / paths to pass to `node --test`. Defaults to Node's auto-discovery (test/, **/*.test.js, etc)."),
+        cwd: z.string().optional(),
+        bail: z.boolean().optional().default(false).describe("Stop on first failure (passes --test-force-exit + sets bail in TEST options)."),
+        pauseOnFailure: z.boolean().optional().default(true).describe("Pre-install an exception breakpoint filtered to AssertionError so assertion failures pause at the throw site."),
+        stopOnEntry: z.boolean().optional().default(false).describe("Pause before the test runner starts. Useful when you want to set BPs in test files before they execute."),
+      },
+    },
+    async ({ pattern, cwd, bail, pauseOnFailure, stopOnEntry }) => {
+      const id = sessions.mintId();
+      const args = ["--test"];
+      if (bail) args.push("--test-force-exit");
+      if (pattern && pattern.length > 0) args.push(...pattern);
+
+      const onAutoChild = async (wsUrl: string) => {
+        const parent = sessions.get(id);
+        if (!parent) return;
+        const childId = sessions.mintId("c");
+        try {
+          const child = await Session.attachAuto(childId, parent, wsUrl);
+          sessions.add(child);
+        } catch (e) {
+          /* logged inside */
+        }
+      };
+
+      const session = await Session.launch(
+        id,
+        {
+          command: ["node", ...args],
+          cwd,
+          stopOnEntry: stopOnEntry ?? false,
+          followChildren: "noBreak",
+          // Apply BEFORE the target resumes — node:test's assertion failure
+          // can fire within ~30ms of launch, faster than a post-launch
+          // setExceptionPause can race in.
+          ...(pauseOnFailure !== false
+            ? { exceptionPause: { state: "all" as const, filter: ["AssertionError"] } }
+            : {}),
+        },
+        onAutoChild,
+      );
+      sessions.add(session);
+
+      if (stopOnEntry) {
+        await session.waitForNextPause(2000);
+      }
+
+      return asToolResult({
+        ...session.snapshot(),
+        runnerArgs: args,
+        pauseOnFailure: pauseOnFailure ?? true,
+      });
+    },
+  );
+
+  server.registerTool(
     "debug_attach",
     {
       title: "debug_attach",
