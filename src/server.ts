@@ -32,9 +32,15 @@ if (
 
 installStdoutGuard();
 
+// Injected by tsup at build time (see tsup.config.ts `define`). Falls back to
+// "dev" when running an unbundled file (e.g. via tsx / vitest).
+declare const __PKG_VERSION__: string;
+const VERSION =
+  typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
+
 const server = new McpServer({
   name: "node-debugger-mcp",
-  version: "0.0.1",
+  version: VERSION,
 });
 
 server.registerTool(
@@ -49,7 +55,7 @@ server.registerTool(
     const payload = {
       ok: true,
       name: "node-debugger-mcp",
-      version: "0.0.1",
+      version: VERSION,
       format: getFormat(),
       echo: message ?? null,
       ts: new Date().toISOString(),

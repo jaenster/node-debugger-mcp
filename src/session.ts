@@ -178,6 +178,8 @@ export class Session {
   cmdline?: string;
   parentSessionId?: string;
   readonly childSessionIds = new Set<string>();
+  /** True when the script being debugged is a known package-manager wrapper (npm/pnpm/yarn). Hidden from list_sessions by default. */
+  isWrapper = false;
   child?: ChildProcess;
   cdp!: CdpClient;
   status: SessionStatus = "running";
@@ -310,6 +312,25 @@ export class Session {
       });
     }
 
+    // Mark wrapper root sessions (e.g. `command:["npm","test"]` launched
+    // npm itself) so list_sessions hides them by default — Claude usually
+    // cares about the auto-attached child running the actual code.
+    if (opts.command) {
+      try {
+        const argv1 = (await session.cdp.Runtime.evaluate({
+          expression: "process.argv[1]",
+          returnByValue: true,
+        })) as { result: { value?: string } };
+        const scriptPath = argv1.result?.value ?? "";
+        if (isWrapperScript(scriptPath)) {
+          session.isWrapper = true;
+          log.info(`session ${id} marked as wrapper (${shortenWrapper(scriptPath)})`);
+        }
+      } catch {
+        /* best-effort */
+      }
+    }
+
     await session.runIfWaitingForDebugger();
 
     // "Resume past Break on start" only applies when we actually launched
@@ -332,12 +353,33 @@ export class Session {
     id: string,
     parent: Session,
     wsUrl: string,
-  ): Promise<Session> {
+  ): Promise<Session | { skipped: string }> {
     const session = new Session(id, "auto");
     session.parentSessionId = parent.id;
     session.cmdline = `auto-attached to ${wsUrl}`;
     session.cdp = await connectToWsUrl(wsUrl);
     await session.setupRoot();
+
+    // Filter out package-manager wrapper processes (npm/pnpm/yarn) — they
+    // open inspectors via the inherited NODE_OPTIONS but their script body
+    // isn't useful to debug. Ask V8 for process.argv[1] and bail if it
+    // matches a known wrapper.
+    try {
+      const argv1 = (await session.cdp.Runtime.evaluate({
+        expression: "process.argv[1]",
+        returnByValue: true,
+      })) as { result: { value?: string } };
+      const scriptPath = argv1.result?.value ?? "";
+      if (isWrapperScript(scriptPath)) {
+        log.info(`session ${id} skipped — wrapper process (${shortenWrapper(scriptPath)})`);
+        await session.cdp.Runtime.runIfWaitingForDebugger();
+        await session.cdp.close().catch(() => {});
+        return { skipped: scriptPath };
+      }
+    } catch {
+      // Best-effort; on failure just proceed with normal attach.
+    }
+
     await session.runIfWaitingForDebugger();
     // Inherit parent's exception-pause state so e.g. `debug_run_tests`'s
     // AssertionError filter applies in the subprocess where `node --test`
@@ -1126,18 +1168,21 @@ export class Session {
       exceptionDetails?: { text: string };
     };
 
+    const status = res.status ?? "Ok";
+
     // Refresh our cached source on success.
-    if (!opts.dryRun && (res.status ?? "Ok") === "Ok") {
+    if (!opts.dryRun && status === "Ok") {
       const entry = this.scripts.get(scriptId);
       if (entry) entry.source = opts.newSource;
     }
 
     return {
-      status: res.status ?? "Ok",
+      status,
       scriptId,
       url,
       ...(res.stackChanged !== undefined ? { stackChanged: res.stackChanged } : {}),
       ...(res.exceptionDetails ? { exceptionDetails: res.exceptionDetails } : {}),
+      ...(status !== "Ok" ? { hint: setScriptSourceHint(status, opts) } : {}),
     };
   }
 
@@ -1969,6 +2014,46 @@ function offsetToLine(offset: number, lineStarts: number[]): number {
     else hi = mid - 1;
   }
   return lo;
+}
+
+/** Translate the terse V8 status from Debugger.setScriptSource into an actionable hint. */
+function setScriptSourceHint(
+  status: string,
+  opts: { allowTopFrameEditing?: boolean },
+): string {
+  switch (status) {
+    case "CompileError":
+      return "The new source has a syntax error. See exceptionDetails.text for the parser message.";
+    case "BlockedByActiveFunction":
+      return opts.allowTopFrameEditing
+        ? "A function whose body changed is currently on the call stack and is not the top frame. V8 cannot replace it while it's executing. Pause higher up or wait for the function to return."
+        : "A function whose body changed is currently on the call stack. If it's just the top frame, retry with allowTopFrameEditing: true.";
+    case "BlockedByActiveGenerator":
+      return "A generator function whose body changed is currently active. V8 cannot replace it while it's running. Resume the generator to completion first.";
+    case "BlockedByTopLevelEsModuleChange":
+      return "The new source changes top-level ES module structure (imports/exports). V8 rejects this — module graph is fixed after load. Only function bodies can change.";
+    default:
+      return `V8 rejected the edit with status '${status}'.`;
+  }
+}
+
+/** Recognise package-manager wrapper scripts so we can skip auto-attaching to them. */
+function isWrapperScript(scriptPath: string): boolean {
+  if (!scriptPath) return false;
+  return (
+    /\/npm\/bin\/npm-cli\.js$/.test(scriptPath) ||
+    /\/npm-cli\.js$/.test(scriptPath) ||
+    /\/yarn(?:\.js|\.cjs)?$/.test(scriptPath) ||
+    /\/yarn\/.*\/yarn\.js$/.test(scriptPath) ||
+    /\/pnpm(?:\.cjs|\.js)?$/.test(scriptPath) ||
+    /\/\.pnpm\/.*\/pnpm\/bin\/pnpm/.test(scriptPath) ||
+    /\/corepack\/dist\/.*\.js$/.test(scriptPath)
+  );
+}
+
+function shortenWrapper(scriptPath: string): string {
+  const slash = scriptPath.lastIndexOf("/");
+  return slash >= 0 ? scriptPath.slice(slash + 1) : scriptPath;
 }
 
 function isInternalUrl(url: string): boolean {

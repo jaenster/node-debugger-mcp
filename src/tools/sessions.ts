@@ -36,6 +36,7 @@ export function registerSessionTools(server: McpServer): void {
         const childId = sessions.mintId("c");
         try {
           const child = await Session.attachAuto(childId, parent, wsUrl);
+          if ("skipped" in child) return; // wrapper (npm/pnpm/yarn) — already disconnected inside
           sessions.add(child);
         } catch (e) {
           // Auto-attach can fail (race against process exit, target taken).
@@ -101,6 +102,7 @@ export function registerSessionTools(server: McpServer): void {
         const childId = sessions.mintId("c");
         try {
           const child = await Session.attachAuto(childId, parent, wsUrl);
+          if ("skipped" in child) return;
           sessions.add(child);
         } catch (e) {
           /* logged inside */
@@ -195,12 +197,19 @@ export function registerSessionTools(server: McpServer): void {
     "debug_list_sessions",
     {
       title: "debug_list_sessions",
-      description: "List all active debug sessions with their status snapshots.",
-      inputSchema: {},
+      description:
+        "List active debug sessions. By default hides 'wrapper' sessions (npm-cli.js / pnpm / yarn etc.) since they're noise — set includeWrappers:true to see them. Each session's snapshot includes parent/child links, pid, cmdline, status, and last pauseState.",
+      inputSchema: {
+        includeWrappers: z.boolean().optional().default(false),
+      },
     },
-    async () => {
+    async ({ includeWrappers }) => {
+      const all = sessions.list();
+      const visible = includeWrappers ? all : all.filter((s) => !s.isWrapper);
+      const hiddenCount = all.length - visible.length;
       return asToolResult({
-        sessions: sessions.list().map((s) => s.snapshot()),
+        sessions: visible.map((s) => s.snapshot()),
+        ...(hiddenCount > 0 ? { hiddenWrappers: hiddenCount } : {}),
       });
     },
   );

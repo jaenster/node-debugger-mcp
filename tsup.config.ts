@@ -1,4 +1,7 @@
 import { defineConfig } from "tsup";
+import { readFileSync } from "node:fs";
+
+const pkg = JSON.parse(readFileSync("./package.json", "utf8")) as { version: string };
 
 // Make CommonJS `require()` calls inside bundled deps work from ESM output.
 // chrome-remote-interface uses `require('events')` etc. internally; without
@@ -25,6 +28,11 @@ export default defineConfig({
   clean: true,
   shims: false,
   banner: { js: cjsShim },
+  // Inject the package version at build time so serverInfo reports the
+  // real shipped version, not whatever was hardcoded in src/server.ts.
+  define: {
+    __PKG_VERSION__: JSON.stringify(pkg.version),
+  },
   noExternal: [
     "@modelcontextprotocol/sdk",
     "@toon-format/toon",
