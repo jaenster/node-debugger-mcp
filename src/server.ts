@@ -12,6 +12,24 @@ import { registerWatchTools } from "./tools/watches.js";
 import { registerOutputTools } from "./tools/output.js";
 import { maybeRegisterRawTool } from "./tools/raw.js";
 
+// CLI dispatch: when invoked with a subcommand (install/uninstall/doctor)
+// we delegate to the CLI module and exit. With no subcommand we start the
+// MCP server on stdio — this is the path Claude Code uses.
+const subcommand = process.argv[2];
+if (
+  subcommand === "install" ||
+  subcommand === "uninstall" ||
+  subcommand === "doctor" ||
+  subcommand === "help" ||
+  subcommand === "--help" ||
+  subcommand === "-h"
+) {
+  const { runCli } = await import("./cli.js");
+  await runCli(subcommand, process.argv.slice(3));
+  // runCli always exits, but TS doesn't know that — guard for safety.
+  process.exit(0);
+}
+
 installStdoutGuard();
 
 const server = new McpServer({

@@ -3,3 +3,5 @@ dist/
 *.log
 .DS_Store
 .node-debugger-mcp.json
+.idea/
+package-lock.json

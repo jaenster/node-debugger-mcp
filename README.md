@@ -6,36 +6,42 @@ Built because Claude couldn't do any of that. Speaks the V8 Inspector Protocol (
 
 ## Install
 
-**macOS / Linux:**
+One command, same on every platform — works on macOS, Linux and Windows:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jaenster/node-debugger-mcp/main/install.sh | bash
+npx -y @jaenster/node-debugger-mcp install
 ```
 
-**Windows (PowerShell):**
-
-```powershell
-irm https://raw.githubusercontent.com/jaenster/node-debugger-mcp/main/install.ps1 | iex
-```
-
-Either bootstraps a checkout into a stable location (`~/.local/share/node-debugger-mcp` / `%LOCALAPPDATA%\node-debugger-mcp`), builds the bundle, and registers with `claude mcp add` at user scope. Re-run any time to update.
+That registers the MCP at `user` scope (available in every Claude Code session) with the command set to `npx -y @jaenster/node-debugger-mcp` — so future sessions resolve and run the latest version automatically. Nothing is installed globally; npx caches it under your usual npm cache.
 
 After install: in an open Claude Code session, type `/mcp` to reconnect; otherwise the tools appear on next session start. Verify with `claude mcp list`.
 
-### Or from npm
-
-```bash
-npm install -g @jaenster/node-debugger-mcp
-claude mcp add -s user node-debugger node-debugger-mcp
-```
-
 ### Flags
 
-- `--allow-raw` — exposes the gated `debug_cdp_raw` escape hatch (`MCP_DEBUGGER_ALLOW_RAW=1`)
-- `--scope=user|local|project` — `claude mcp add` scope, defaults to `user`
+```bash
+# Expose the gated debug_cdp_raw escape hatch:
+npx -y @jaenster/node-debugger-mcp install --allow-raw
+
+# Pin to a specific version instead of latest:
+npx -y @jaenster/node-debugger-mcp install --pin=0.1.0
+
+# Project scope (.mcp.json in cwd) or local scope:
+npx -y @jaenster/node-debugger-mcp install --scope=project
+```
+
+### Status / uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/jaenster/node-debugger-mcp/main/install.sh | bash -s -- --allow-raw
+npx -y @jaenster/node-debugger-mcp doctor       # node version, claude CLI, registration
+npx -y @jaenster/node-debugger-mcp uninstall    # removes the registration
+```
+
+### Manual registration
+
+If you don't want to run the install subcommand, the equivalent one-liner is:
+
+```bash
+claude mcp add -s user node-debugger -- npx -y @jaenster/node-debugger-mcp
 ```
 
 ## What you get
@@ -93,26 +99,23 @@ Once installed, Claude has these tools available (prefix `debug_`):
 ```bash
 git clone https://github.com/jaenster/node-debugger-mcp.git
 cd node-debugger-mcp
-./install.sh
-```
-
-Or with the smoke-test harness:
-
-```bash
 npm install
-npm run build
-npm run smoke           # basic flow
-node scripts/smoke-sourcemap.mjs    # TS / source-map BPs
-node scripts/smoke-worker.mjs       # worker_threads auto-attach
-node scripts/smoke-async-context.mjs # AsyncLocalStorage discovery
-# etc. — see scripts/ for the full set
+npm run build           # produces dist/server.js
+npm run smoke           # basic flow against fixtures/hello.js
+
+# Other smoke harnesses for specific features:
+node scripts/smoke-sourcemap.mjs        # TS / source-map BPs
+node scripts/smoke-worker.mjs           # worker_threads auto-attach
+node scripts/smoke-async-context.mjs    # AsyncLocalStorage discovery
+node scripts/smoke-children.mjs         # child-process auto-attach
+node scripts/smoke-persist.mjs          # persistent breakpoint round-trip
+# … see scripts/ for the full set
 ```
 
-## Uninstall
+To register a development checkout with Claude Code without going through npm:
 
 ```bash
-claude mcp remove -s user node-debugger
-rm -rf ~/.local/share/node-debugger-mcp        # or %LOCALAPPDATA%\node-debugger-mcp on Windows
+claude mcp add -s user node-debugger node /absolute/path/to/dist/server.js
 ```
 
 ## Stack
