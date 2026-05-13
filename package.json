@@ -1,0 +1,66 @@
+{
+  "name": "@jaenster/node-debugger-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server that lets Claude drive a Node.js debugger via the V8 Inspector Protocol — breakpoints, stepping, eval, scope inspection, watches, source-map-aware BPs, child-process and worker-thread auto-attach.",
+  "type": "module",
+  "bin": {
+    "node-debugger-mcp": "./dist/server.js"
+  },
+  "files": [
+    "dist/server.js",
+    "dist/server.js.map",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "author": "jaenster <github@jaenster.net>",
+  "homepage": "https://github.com/jaenster/node-debugger-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaenster/node-debugger-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jaenster/node-debugger-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude",
+    "debugger",
+    "node",
+    "v8-inspector",
+    "chrome-devtools-protocol",
+    "cdp",
+    "breakpoint",
+    "anthropic"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "smoke": "node scripts/smoke.mjs",
+    "start": "node dist/server.js",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@jridgewell/trace-mapping": "^0.3.31",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@toon-format/toon": "^2.2.0",
+    "chrome-remote-interface": "^0.34.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/chrome-remote-interface": "^0.31.10",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
