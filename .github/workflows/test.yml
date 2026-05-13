@@ -39,9 +39,7 @@ jobs:
         run: node scripts/smoke-attach.mjs
 
       - name: Build TS fixture
-        run: |
-          cd fixtures/ts-app
-          ../../node_modules/.bin/tsc
+        run: npx tsc -p fixtures/ts-app
 
       - name: Smoke — source-map BPs (tsc-built TS)
         run: node scripts/smoke-sourcemap.mjs

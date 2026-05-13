@@ -33,9 +33,11 @@ console.log("result:", result);
 `;
 writeFileSync(resolve(outDir, "src", "compute.ts"), tsSource);
 
-// 2. Compile with tsc to get a valid sourcemap.
-const tsc = resolve(repoRoot, "node_modules", ".bin", "tsc");
-const tscRes = spawnSync(tsc, [
+// 2. Compile with tsc to get a valid sourcemap. Invoke via `npx` so Windows
+// gets the right .cmd shim automatically (the bare `node_modules/.bin/tsc`
+// path doesn't exist as an executable on Windows).
+const tscArgs = [
+  "tsc",
   resolve(outDir, "src", "compute.ts"),
   "--target", "ES2022",
   "--module", "ESNext",
@@ -44,9 +46,14 @@ const tscRes = spawnSync(tsc, [
   "--sourceMap",
   "--rootDir", resolve(outDir, "src"),
   "--skipLibCheck",
-], { encoding: "utf8" });
+];
+const tscRes = spawnSync(
+  process.platform === "win32" ? "npx.cmd" : "npx",
+  tscArgs,
+  { encoding: "utf8", cwd: repoRoot },
+);
 if (tscRes.status !== 0) {
-  console.error("tsc failed:", tscRes.stderr || tscRes.stdout);
+  console.error("tsc failed:", tscRes.stderr || tscRes.stdout || `exit ${tscRes.status}`);
   process.exit(1);
 }
 
