@@ -8,7 +8,12 @@
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { resolve as pathResolve, dirname as pathDirname, isAbsolute } from "node:path";
+import {
+  resolve as pathResolve,
+  dirname as pathDirname,
+  isAbsolute,
+  sep as pathSep,
+} from "node:path";
 import {
   TraceMap,
   originalPositionFor,
@@ -128,10 +133,27 @@ export class SourceMapIndex {
         column: opts.column0,
       });
       if (orig.source === null || orig.line === null || orig.column === null) return null;
-      const rawIdx = entry.rawSources.indexOf(orig.source);
-      const normalized = rawIdx >= 0 ? entry.normalizedSources[rawIdx]! : orig.source;
+      // Match via exact then suffix — trace-mapping may return a slightly
+      // different form than what we stored in rawSources (e.g. it strips
+      // `./` segments, which our raw store didn't). Strip protocol +
+      // leading `./` from both sides before comparing.
+      const stripForCompare = (s: string) =>
+        s.replace(/\\/g, "/").replace(/^[a-z]+:\/+/i, "").replace(/^\.\//, "");
+      let normalized: string | undefined;
+      const exact = entry.rawSources.indexOf(orig.source);
+      if (exact >= 0) {
+        normalized = entry.normalizedSources[exact];
+      } else {
+        const wantStripped = stripForCompare(orig.source);
+        for (let i = 0; i < entry.rawSources.length; i++) {
+          if (stripForCompare(entry.rawSources[i] ?? "") === wantStripped) {
+            normalized = entry.normalizedSources[i];
+            break;
+          }
+        }
+      }
       return {
-        url: normalized,
+        url: normalized ?? orig.source,
         line0: orig.line - 1, // → 0-indexed
         column0: orig.column,
       };
@@ -140,22 +162,74 @@ export class SourceMapIndex {
     }
   }
 
+  /**
+   * Get the source for `sourceUrl` as the runtime sees it via the sourcemap.
+   * Tries embedded `sourcesContent` first. Falls back to reading the file
+   * from disk when the sourcemap was emitted without inline sources (e.g.
+   * esbuild's default). Returns undefined when neither is available —
+   * caller should omit the snippet rather than render something misleading.
+   */
   sourceContent(scriptId: string, sourceUrl: string): string | undefined {
     const entry = this.byScriptId.get(scriptId);
     if (!entry) return undefined;
-    // Try to find the raw `sources[i]` that corresponds to the requested URL.
+    // Find which sources[i] corresponds to the requested URL.
+    let idx = -1;
+    const wantFwd = sourceUrl.replace(/\\/g, "/");
     for (let i = 0; i < entry.normalizedSources.length; i++) {
+      const norm = (entry.normalizedSources[i] ?? "").replace(/\\/g, "/");
+      const raw = entry.rawSources[i] ?? "";
       if (
-        entry.normalizedSources[i] === sourceUrl ||
-        entry.rawSources[i] === sourceUrl ||
-        absolutize(entry.normalizedSources[i] ?? "") === absolutize(sourceUrl)
+        norm === wantFwd ||
+        raw === sourceUrl ||
+        absolutize(norm) === absolutize(wantFwd)
       ) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx < 0) return undefined;
+    try {
+      const embedded = sourceContentFor(entry.traceMap, entry.rawSources[idx]!);
+      if (embedded != null) return embedded;
+    } catch {
+      // fall through to disk
+    }
+    // sourcesContent is missing. Try disk — sync read is fine here since
+    // snippets are rendered on the pause path which is already chatty.
+    const norm = entry.normalizedSources[idx] ?? "";
+    if (!norm) return undefined;
+    try {
+      const fs = require("node:fs") as typeof import("node:fs");
+      const candidates: string[] = [];
+      if (isAbsolute(norm)) {
+        candidates.push(norm);
+      } else if (entry.scriptUrl.startsWith("file://")) {
+        // For project-relative sources (e.g. webpack:///./src/foo.ts which
+        // we stored as `src/foo.ts`), try resolving against likely roots:
+        // the script's dir, its parent, grandparent. Catches the typical
+        // `<root>/dist/bundle.js` + `<root>/src/foo.ts` layout.
         try {
-          return sourceContentFor(entry.traceMap, entry.rawSources[i]!) ?? undefined;
+          const scriptPath = fileURLToPath(entry.scriptUrl);
+          let dir = pathDirname(scriptPath);
+          for (let i = 0; i < 5; i++) {
+            candidates.push(pathResolve(dir, norm));
+            const parent = pathDirname(dir);
+            if (parent === dir) break;
+            dir = parent;
+          }
         } catch {
-          return undefined;
+          /* ignore */
         }
       }
+      for (const c of candidates) {
+        try {
+          return fs.readFileSync(c, "utf8");
+        } catch {
+          continue;
+        }
+      }
+    } catch {
+      /* not available; caller will omit */
     }
     return undefined;
   }
@@ -170,17 +244,24 @@ function matchSourceIndex(
   wantAbs: string,
   wantRaw: string,
 ): number {
+  // Normalize all candidates to forward-slash form so Windows backslashes
+  // don't break suffix matching when the caller passed POSIX-style paths
+  // (or vice versa).
+  const wantAbsFwd = wantAbs.replace(/\\/g, "/");
+  const wantRawFwd = wantRaw.replace(/\\/g, "/");
+  const normFwd = normalized.map((n) => (n ?? "").replace(/\\/g, "/"));
+
   // 1. Exact match against the normalized absolute paths.
-  for (let i = 0; i < normalized.length; i++) {
-    if (normalized[i] === wantAbs) return i;
+  for (let i = 0; i < normFwd.length; i++) {
+    if (normFwd[i] === wantAbsFwd) return i;
   }
   // 2. Suffix match against the raw or normalized — handles bundlers whose
   //    `sources[]` is something like `webpack:///./src/foo.ts` while the
   //    caller passed `src/foo.ts` or `/abs/path/src/foo.ts`.
-  for (let i = 0; i < normalized.length; i++) {
-    const norm = normalized[i] ?? "";
-    if (norm.endsWith(wantAbs) || norm.endsWith(wantRaw)) return i;
-    if (wantAbs.endsWith(norm) || wantRaw.endsWith(norm)) return i;
+  for (let i = 0; i < normFwd.length; i++) {
+    const norm = normFwd[i] ?? "";
+    if (norm.endsWith(wantAbsFwd) || norm.endsWith(wantRawFwd)) return i;
+    if (wantAbsFwd.endsWith(norm) || wantRawFwd.endsWith(norm)) return i;
   }
   return -1;
 }
@@ -202,13 +283,28 @@ function normalizeSource(
   sourceRoot?: string,
 ): string {
   if (!src) return "";
-  // Apply sourceRoot if relative.
-  if (sourceRoot && !/^([a-z]+:|\/)/.test(src)) {
+  // Strip query/hash suffixes that some bundlers append (e.g. `foo.ts?v=123`).
+  src = src.replace(/[?#].*$/, "");
+  // Apply sourceRoot if the source is relative. Some bundlers set sourceRoot
+  // to a protocol URL like `webpack:///` which still counts as a "root" to
+  // join against.
+  if (sourceRoot && !/^([a-z][a-z0-9+.-]*:|\/)/i.test(src)) {
     src = sourceRoot.endsWith("/") ? sourceRoot + src : `${sourceRoot}/${src}`;
   }
-  // Strip well-known bundler prefixes.
-  src = src.replace(/^webpack:\/\/\/?\.?\//, "");
+  // Detect bundler protocol prefixes BEFORE stripping. Sources behind these
+  // protocols are conceptually project-relative (relative to the user's repo
+  // root, not the bundle output dir) — resolving them against the script's
+  // dist directory produces garbage paths. We strip the protocol and keep
+  // the bare-relative form so suffix matching against the user's path works.
+  const hadBundlerProtocol =
+    /^webpack(?:-internal)?:\/\//.test(src) ||
+    /^rollup:\/\/\//.test(src) ||
+    /^vite:\/\//.test(src);
+  src = src.replace(/^webpack:\/\/\/?(?:\.\/)?/, "");
+  src = src.replace(/^webpack-internal:\/\/\//, "");
   src = src.replace(/^webpack:\/\//, "");
+  src = src.replace(/^rollup:\/\/\//, "");
+  src = src.replace(/^vite:\/\//, "");
   if (src.startsWith("file://")) {
     try {
       return fileURLToPath(src);
@@ -217,6 +313,12 @@ function normalizeSource(
     }
   }
   if (isAbsolute(src)) return src;
+  if (hadBundlerProtocol) {
+    // Don't resolve against the bundle's dir — keep the project-relative
+    // form (e.g. `src/foo.ts`) so suffix-matching against the user's path
+    // (`/abs/repo/src/foo.ts`) succeeds.
+    return src.replace(/^\.\//, "");
+  }
   // Resolve relative to the script URL's directory, collapsing `..` and `.`.
   if (scriptUrl.startsWith("file://")) {
     try {

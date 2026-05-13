@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { resolve as pathResolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { connectToWsUrl, type CdpClient } from "./cdp/client.js";
 import { ObjectRegistry } from "./cdp/object-registry.js";
 import {
@@ -586,12 +587,15 @@ export class Session {
       let snippet: string | undefined;
       if (allBuilt.length === 0) {
         if (orig) {
+          // When the frame has a source-mapped original position, the snippet
+          // MUST come from the original source (embedded sourcesContent, or
+          // disk fallback). Falling back to the compiled JS at this point
+          // would render confusingly wrong code.
           const embedded = this.sourceMaps.sourceContent(f.location.scriptId, orig.url);
           if (embedded !== undefined) {
             snippet = renderSnippet(embedded, orig.line0);
-          } else if (script && script.url.startsWith("file://")) {
-            snippet = await this.snippetFor(script, compiledLine);
           }
+          // else: original source unavailable — omit snippet rather than mislead.
         } else if (script && script.url.startsWith("file://")) {
           snippet = await this.snippetFor(script, compiledLine);
         }
@@ -791,10 +795,21 @@ export class Session {
     return await this.armPause()(timeoutMs);
   }
 
-  /** Build the urlRegex that matches both file:// and bare absolute paths for a given absolute path. */
+  /**
+   * Build a urlRegex that matches the canonical file:// URL that V8 reports
+   * for `absFile`. Uses pathToFileURL so Windows paths (`C:\Users\...`)
+   * become `file:///C:/Users/...` with forward slashes, matching what V8
+   * actually emits. Also tolerates bare-absolute-path URLs for non-Windows.
+   */
   private fileUrlRegex(absFile: string): string {
-    const escaped = absFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return `^(file://)?${escaped}$`;
+    let urlForm: string;
+    try {
+      urlForm = pathToFileURL(absFile).href;
+    } catch {
+      urlForm = `file://${absFile}`;
+    }
+    const escaped = urlForm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return `^${escaped}$`;
   }
 
   /** Compose user condition with hit-count counter into a single CDP condition. */
@@ -1683,8 +1698,11 @@ export class Session {
     nodeCount: number;
     topByCount: Array<{ name: string; count: number; selfSize: number }>;
   }> {
-    const path = opts.savePath ?? `/tmp/ndb-heap-${this.id}-${Date.now()}.heapsnapshot`;
     const { writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const path =
+      opts.savePath ?? join(tmpdir(), `ndb-heap-${this.id}-${Date.now()}.heapsnapshot`);
 
     const chunks: string[] = [];
     const onChunk = (event: unknown) => {

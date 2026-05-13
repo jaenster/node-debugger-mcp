@@ -7,16 +7,18 @@ import { setTimeout as wait } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const serverPath = resolve(here, "..", "dist", "server.js");
 
 // Materialise a tiny npm package in /tmp.
-const demoDir = "/tmp/ndb-npm-demo";
+const demoDir = join(tmpdir(), "ndb-npm-demo");
 mkdirSync(demoDir, { recursive: true });
 writeFileSync(`${demoDir}/package.json`, JSON.stringify({
   name: "ndb-npm-demo", type: "module",
-  scripts: { "run-it": "node ./worker.js" }
+  scripts: { "run-it": "node worker.js" }
 }, null, 2));
 writeFileSync(`${demoDir}/worker.js`, `
 let n = 0;

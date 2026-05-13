@@ -1,0 +1,83 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    name: ${{ matrix.os }} / Node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [22, 24]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Smoke — basic flow (launch, BP, step, eval, scopes)
+        run: node scripts/smoke.mjs
+
+      - name: Smoke — extra BP kinds (hit-count, exception, clear)
+        run: node scripts/smoke-bp.mjs
+
+      - name: Smoke — output + watches + logpoints
+        run: node scripts/smoke-output.mjs
+
+      - name: Smoke — external attach (--inspect target)
+        run: node scripts/smoke-attach.mjs
+
+      - name: Build TS fixture
+        run: |
+          cd fixtures/ts-app
+          ../../node_modules/.bin/tsc
+
+      - name: Smoke — source-map BPs (tsc-built TS)
+        run: node scripts/smoke-sourcemap.mjs
+
+      - name: Smoke — webpack-style sourcemaps + disk fallback
+        run: node scripts/smoke-sourcemap-webpack.mjs
+
+      - name: Smoke — child-process auto-attach
+        run: node scripts/smoke-children.mjs
+
+      - name: Smoke — worker-thread auto-attach (bootstrap shim)
+        run: node scripts/smoke-worker.mjs
+
+      - name: Smoke — AsyncLocalStorage discovery
+        run: node scripts/smoke-async-context.mjs
+
+      - name: Smoke — event-loop status
+        run: node scripts/smoke-event-loop.mjs
+
+      - name: Smoke — function-execution trace
+        run: node scripts/smoke-trace.mjs
+
+      - name: Smoke — per-line coverage
+        run: node scripts/smoke-coverage.mjs
+
+      - name: Smoke — node:test runner with pauseOnFailure
+        run: node scripts/smoke-tests.mjs
+
+      - name: Smoke — CPU profile + heap snapshot
+        run: node scripts/smoke-perf.mjs
+
+      - name: Smoke — persistent breakpoints round-trip
+        run: node scripts/smoke-persist.mjs
+
+      - name: Smoke — npm wrapper auto-attach
+        run: node scripts/smoke-npm-wrapper.mjs
+
+      - name: Smoke — showcase (exception/eval/patch/coverage)
+        run: node scripts/smoke-showcase.mjs
