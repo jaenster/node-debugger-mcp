@@ -27,7 +27,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          # Node 24+ for npm's OIDC trusted-publishing support (newer feature).
+          node-version: 24
           cache: 'npm'
           registry-url: 'https://registry.npmjs.org'
 
