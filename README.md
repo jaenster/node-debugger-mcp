@@ -1,5 +1,10 @@
 # node-debugger-mcp
 
+[![npm](https://img.shields.io/npm/v/@jaenster/node-debugger-mcp.svg?label=npm)](https://www.npmjs.com/package/@jaenster/node-debugger-mcp)
+[![license](https://img.shields.io/npm/l/@jaenster/node-debugger-mcp.svg)](LICENSE)
+[![node](https://img.shields.io/node/v/@jaenster/node-debugger-mcp.svg)](https://nodejs.org)
+[![MCP](https://img.shields.io/badge/MCP-Model_Context_Protocol-blue)](https://modelcontextprotocol.io)
+
 An MCP server that gives Claude a real Node.js debugger — breakpoints, stepping, scope inspection, eval, watches, source-map-aware BPs, child-process and worker-thread auto-attach, and a few things even IDEs don't usually expose like discovering every live `AsyncLocalStorage` instance.
 
 Built because Claude couldn't do any of that. Speaks the V8 Inspector Protocol (the same one Chrome DevTools and JetBrains use), shipped as a single bundled JS file you wire into your Claude Code MCP config.
@@ -122,6 +127,19 @@ claude mcp add -s user node-debugger node /absolute/path/to/dist/server.js
 
 TypeScript (ESM, target ES2022), bundled with [`tsup`](https://tsup.egoist.dev/) to a single ~1.9 MB `dist/server.js` (chrome-remote-interface, @modelcontextprotocol/sdk, zod, @jridgewell/trace-mapping, @toon-format/toon all inlined). Speaks the V8 Inspector Protocol over WebSocket via [`chrome-remote-interface`](https://github.com/cyrus-and/chrome-remote-interface). Source maps via [`@jridgewell/trace-mapping`](https://github.com/jridgewell/trace-mapping). Minimum Node 20 LTS.
 
+## Related
+
+Other MCP servers by the same author:
+
+- [**remote-shell-mcp**](https://github.com/jaenster/remote-shell-mcp) — persistent SSH, SFTP, port forwarding, and Docker over MCP. A long-running daemon so sessions, tunnels, and PTY shells survive across Claude Code / Claude Desktop / Cursor / Codex CLI restarts.
+
+## Links
+
+- [npm: @jaenster/node-debugger-mcp](https://www.npmjs.com/package/@jaenster/node-debugger-mcp)
+- [GitHub releases](https://github.com/jaenster/node-debugger-mcp/releases)
+- [Issues / bug reports](https://github.com/jaenster/node-debugger-mcp/issues)
+- [Model Context Protocol spec](https://modelcontextprotocol.io)
+
 ## License
 
-MIT
+[MIT](LICENSE) © jaenster
