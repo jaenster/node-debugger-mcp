@@ -1,6 +1,6 @@
 {
   "name": "@jaenster/node-debugger-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Model Context Protocol server that lets Claude drive a Node.js debugger via the V8 Inspector Protocol — breakpoints, stepping, eval, scope inspection, watches, source-map-aware BPs, child-process and worker-thread auto-attach.",
   "type": "module",
   "bin": {
