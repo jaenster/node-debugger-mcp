@@ -47,11 +47,12 @@ const tscArgs = [
   "--rootDir", resolve(outDir, "src"),
   "--skipLibCheck",
 ];
-const tscRes = spawnSync(
-  process.platform === "win32" ? "npx.cmd" : "npx",
-  tscArgs,
-  { encoding: "utf8", cwd: repoRoot },
-);
+const tscRes = spawnSync("npx", tscArgs, {
+  encoding: "utf8",
+  cwd: repoRoot,
+  // shell:true so Windows resolves npx.cmd via PATHEXT.
+  shell: true,
+});
 if (tscRes.status !== 0) {
   console.error("tsc failed:", tscRes.stderr || tscRes.stdout || `exit ${tscRes.status}`);
   process.exit(1);
