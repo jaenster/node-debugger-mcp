@@ -67,6 +67,16 @@ export interface PauseSnapshot {
    * handful of frames each. Null when no async stack is attached.
    */
   asyncStack?: AsyncStackEntry[];
+  /**
+   * Populated when reason is "exception" or "promiseRejection". The
+   * description includes the stack for Error subclasses (V8 puts the
+   * `Error.toString()` form in there).
+   */
+  exception?: {
+    className?: string;
+    description?: string;
+    uncaught?: boolean;
+  };
   watches?: WatchResult[];
 }
 
@@ -484,7 +494,7 @@ export class Session {
       reason: string;
       hitBreakpoints?: string[];
       callFrames: RawCallFrame[];
-      data?: { className?: string; description?: string };
+      data?: { className?: string; description?: string; uncaught?: boolean };
       asyncStackTrace?: RawAsyncStackTrace;
     };
 
@@ -597,6 +607,14 @@ export class Session {
     }
 
     const asyncStack = e.asyncStackTrace ? summariseAsyncStack(e.asyncStackTrace) : undefined;
+    const exception =
+      (e.reason === "exception" || e.reason === "promiseRejection") && e.data
+        ? {
+            ...(e.data.className ? { className: e.data.className } : {}),
+            ...(e.data.description ? { description: e.data.description } : {}),
+            ...(e.data.uncaught !== undefined ? { uncaught: e.data.uncaught } : {}),
+          }
+        : undefined;
 
     this.pauseState = {
       reason: e.reason,
@@ -606,6 +624,7 @@ export class Session {
       frames,
       ...(hiddenInternalCount > 0 ? { hiddenInternalFrames: hiddenInternalCount } : {}),
       ...(asyncStack && asyncStack.length > 0 ? { asyncStack } : {}),
+      ...(exception ? { exception } : {}),
       ...(watchResults.length > 0 ? { watches: watchResults } : {}),
     };
     this.status = "paused";
@@ -1053,6 +1072,75 @@ export class Session {
     return rec;
   }
 
+  // -- Live source patching ---------------------------------------------
+
+  /**
+   * Replace a script's source at runtime via Debugger.setScriptSource. V8
+   * restrictions apply: can't change function arity, scope structure, or
+   * top-level ES module imports. Will fail with `BlockedByActiveFunction`
+   * if a function whose body changed is on the call stack (unless
+   * `allowTopFrameEditing` is true and the only such function is the top
+   * frame). Useful for "patch the bug then continue without restarting."
+   */
+  async patchScriptSource(opts: {
+    file: string;
+    newSource: string;
+    dryRun?: boolean;
+    allowTopFrameEditing?: boolean;
+  }): Promise<{
+    status: string;
+    scriptId: string;
+    url: string;
+    stackChanged?: boolean;
+    exceptionDetails?: { text: string };
+  } | { error: string }> {
+    // Resolve `file` to a scriptId — accept a V8 scriptId, a file:// URL, or
+    // a plain absolute path.
+    let scriptId: string | undefined;
+    let url: string | undefined;
+    if (this.scripts.has(opts.file)) {
+      scriptId = opts.file;
+      url = this.scripts.get(opts.file)!.url;
+    } else {
+      const want = opts.file.startsWith("file://")
+        ? opts.file
+        : `file://${pathResolve(opts.file)}`;
+      for (const s of this.scripts.values()) {
+        if (s.url === want || s.url === opts.file) {
+          scriptId = s.scriptId;
+          url = s.url;
+          break;
+        }
+      }
+    }
+    if (!scriptId || !url) return { error: `no script matching '${opts.file}'` };
+
+    const res = (await this.cdp.Debugger.setScriptSource({
+      scriptId,
+      scriptSource: opts.newSource,
+      dryRun: opts.dryRun ?? false,
+      allowTopFrameEditing: opts.allowTopFrameEditing ?? false,
+    })) as {
+      status?: string;
+      stackChanged?: boolean;
+      exceptionDetails?: { text: string };
+    };
+
+    // Refresh our cached source on success.
+    if (!opts.dryRun && (res.status ?? "Ok") === "Ok") {
+      const entry = this.scripts.get(scriptId);
+      if (entry) entry.source = opts.newSource;
+    }
+
+    return {
+      status: res.status ?? "Ok",
+      scriptId,
+      url,
+      ...(res.stackChanged !== undefined ? { stackChanged: res.stackChanged } : {}),
+      ...(res.exceptionDetails ? { exceptionDetails: res.exceptionDetails } : {}),
+    };
+  }
+
   // -- Watches -----------------------------------------------------------
 
   addWatch(expression: string): WatchRecord {
@@ -1164,6 +1252,16 @@ export class Session {
 
   // -- Inspection --------------------------------------------------------
 
+  /** Pick the first non-internal frame ordinal, or 0 if all are internal. */
+  private defaultEvalFrameOrdinal(): number {
+    for (let i = 0; i < this.currentFrames.length; i++) {
+      const f = this.currentFrames[i]!;
+      const url = this.scripts.get(f.location.scriptId)?.url ?? f.url ?? "";
+      if (!isInternalUrl(url)) return i;
+    }
+    return 0;
+  }
+
   async evaluate(opts: {
     expression: string;
     frameOrdinal?: number;
@@ -1171,7 +1269,7 @@ export class Session {
   }): Promise<ShapedValue | { error: string }> {
     const returnByValue = opts.returnByValue ?? false;
     if (this.currentFrames.length > 0) {
-      const ord = opts.frameOrdinal ?? 0;
+      const ord = opts.frameOrdinal ?? this.defaultEvalFrameOrdinal();
       const frame = this.currentFrames[ord];
       if (!frame) return { error: `no frame at ordinal ${ord}` };
       const res = (await this.cdp.Debugger.evaluateOnCallFrame({
@@ -1337,6 +1435,131 @@ export class Session {
       instances.push(flat);
     }
     return { count: instances.length, instances };
+  }
+
+  // -- Line-level coverage ----------------------------------------------
+
+  /**
+   * Self-contained line-coverage capture: start precise coverage with
+   * `detailed: true`, sleep `durationMs`, stop, then project the function
+   * ranges onto line numbers (1-indexed) so the caller can see exactly
+   * which lines of which files ran. Answers "is my test exercising what
+   * I think it is?"
+   */
+  async coverage(opts: {
+    durationMs: number;
+    urlFilter?: string;
+    includeNodeInternals?: boolean;
+  }): Promise<{
+    durationMs: number;
+    files: Array<{
+      url: string;
+      totalLines: number;
+      executedLines: number;
+      missedLines: number;
+      coveragePct: number;
+      missed: number[];
+    }>;
+  }> {
+    await this.cdp.Profiler.enable();
+    await this.cdp.Profiler.startPreciseCoverage({ callCount: true, detailed: true });
+    await new Promise((r) => setTimeout(r, opts.durationMs));
+    const cov = (await this.cdp.Profiler.takePreciseCoverage()) as {
+      result: Array<{
+        scriptId: string;
+        url: string;
+        functions: Array<{
+          ranges: Array<{ startOffset: number; endOffset: number; count: number }>;
+        }>;
+      }>;
+    };
+    await this.cdp.Profiler.stopPreciseCoverage();
+    await this.cdp.Profiler.disable();
+
+    const include = !!opts.includeNodeInternals;
+    const filter = opts.urlFilter;
+    const out: Array<{
+      url: string;
+      totalLines: number;
+      executedLines: number;
+      missedLines: number;
+      coveragePct: number;
+      missed: number[];
+    }> = [];
+
+    for (const script of cov.result) {
+      if (!include && isInternalUrl(script.url)) continue;
+      if (filter && !script.url.includes(filter)) continue;
+
+      // Fetch the script source so we can map offsets → line numbers.
+      let source: string;
+      try {
+        const res = (await this.cdp.Debugger.getScriptSource({
+          scriptId: script.scriptId,
+        })) as { scriptSource: string };
+        source = res.scriptSource;
+      } catch {
+        continue;
+      }
+
+      // Build cumulative line offsets: lineStarts[i] = char offset of line i (0-indexed).
+      const lineStarts: number[] = [0];
+      for (let i = 0; i < source.length; i++) {
+        if (source.charCodeAt(i) === 10 /* \n */) lineStarts.push(i + 1);
+      }
+      const totalLines = lineStarts.length;
+
+      // V8 reports nested ranges for each function: ranges[0] covers the full
+      // function body, subsequent ranges narrow down to specific blocks (taken
+      // and untaken branches). To honour the hierarchy, we sort ranges from
+      // widest to narrowest and overwrite the count per line — narrower
+      // ranges (which represent specific branches) win over wider ones (the
+      // outer function entry).
+      const lineCount = new Int32Array(totalLines).fill(-1);
+      const allRanges: Array<{ startOffset: number; endOffset: number; count: number; size: number }> = [];
+      for (const fn of script.functions) {
+        for (const r of fn.ranges) {
+          allRanges.push({ ...r, size: r.endOffset - r.startOffset });
+        }
+      }
+      allRanges.sort((a, b) => b.size - a.size); // widest first
+      for (const r of allRanges) {
+        const start = offsetToLine(r.startOffset, lineStarts);
+        const end = offsetToLine(Math.max(r.startOffset, r.endOffset - 1), lineStarts);
+        for (let line = start; line <= end && line < totalLines; line++) {
+          lineCount[line] = r.count;
+        }
+      }
+      // executed[line] = lineCount > 0
+      const executed = new Uint8Array(totalLines);
+      for (let i = 0; i < totalLines; i++) {
+        if (lineCount[i]! > 0) executed[i] = 1;
+      }
+
+      const missed: number[] = [];
+      let executedCount = 0;
+      for (let i = 0; i < totalLines; i++) {
+        // Skip blank lines for the missed list — they trivially aren't "covered" but it's noise.
+        const lineText = source.slice(lineStarts[i]!, lineStarts[i + 1] ?? source.length).trim();
+        if (!lineText) continue;
+        if (executed[i]) {
+          executedCount++;
+        } else {
+          missed.push(i + 1); // 1-indexed for display
+        }
+      }
+      const meaningful = executedCount + missed.length;
+      out.push({
+        url: script.url,
+        totalLines,
+        executedLines: executedCount,
+        missedLines: missed.length,
+        coveragePct: meaningful > 0 ? Math.round((executedCount / meaningful) * 1000) / 10 : 0,
+        missed,
+      });
+    }
+
+    return { durationMs: opts.durationMs, files: out };
   }
 
   // -- CPU profile ------------------------------------------------------
@@ -1734,6 +1957,18 @@ export class Session {
     }
     return out;
   }
+}
+
+/** Binary search lineStarts for the line containing `offset`. */
+function offsetToLine(offset: number, lineStarts: number[]): number {
+  let lo = 0;
+  let hi = lineStarts.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >>> 1;
+    if (lineStarts[mid]! <= offset) lo = mid;
+    else hi = mid - 1;
+  }
+  return lo;
 }
 
 function isInternalUrl(url: string): boolean {

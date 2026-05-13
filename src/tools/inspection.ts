@@ -170,6 +170,28 @@ export function registerInspectionTools(server: McpServer): void {
   );
 
   server.registerTool(
+    "debug_patch_source",
+    {
+      title: "debug_patch_source",
+      description:
+        "Replace a script's source AT RUNTIME via Debugger.setScriptSource — the 'edit-and-continue' feature IDEs use. Pass the file path (or V8 scriptId) and the FULL new source. V8 restrictions: cannot change function arity, scope structure, or top-level ES module imports. Returns `status`: 'Ok' (applied) or 'CompileError' / 'BlockedByActiveGenerator' / 'BlockedByActiveFunction' / 'BlockedByTopLevelEsModuleChange' on rejection. Use `dryRun: true` to verify the edit would apply without changing anything. `allowTopFrameEditing: true` lets you replace the body of the function currently on top of the call stack — the only function that's normally blocked because it's executing.",
+      inputSchema: {
+        sessionId: z.string().optional(),
+        file: z.string().describe("File path, file:// URL, or V8 scriptId of the script to patch."),
+        newSource: z.string().describe("The complete new source for the script."),
+        dryRun: z.boolean().optional().default(false),
+        allowTopFrameEditing: z.boolean().optional().default(false),
+      },
+    },
+    async ({ sessionId, file, newSource, dryRun, allowTopFrameEditing }) => {
+      const session = sessions.resolve(sessionId);
+      if (!session) return asToolResult({ error: "no such session" });
+      const res = await session.patchScriptSource({ file, newSource, dryRun, allowTopFrameEditing });
+      return asToolResult(res);
+    },
+  );
+
+  server.registerTool(
     "debug_cpu_profile",
     {
       title: "debug_cpu_profile",
@@ -186,6 +208,27 @@ export function registerInspectionTools(server: McpServer): void {
       const session = sessions.resolve(sessionId);
       if (!session) return asToolResult({ error: "no such session" });
       const res = await session.cpuProfile({ durationMs, topN, includeNodeInternals });
+      return asToolResult(res);
+    },
+  );
+
+  server.registerTool(
+    "debug_coverage",
+    {
+      title: "debug_coverage",
+      description:
+        "Capture per-line code coverage during `durationMs` of execution. Returns, for each matching script: total lines, executed lines, missed lines (with their line numbers, 1-indexed), and a coverage percentage. Different from debug_cpu_profile (sampling-based, hottest functions) and from debug_trace_stop (function-level call counts) — this gives you the per-line execution map. Answers 'is my test actually exercising the code I think?'.",
+      inputSchema: {
+        sessionId: z.string().optional(),
+        durationMs: z.number().int().positive().default(2000),
+        urlFilter: z.string().optional(),
+        includeNodeInternals: z.boolean().optional().default(false),
+      },
+    },
+    async ({ sessionId, durationMs, urlFilter, includeNodeInternals }) => {
+      const session = sessions.resolve(sessionId);
+      if (!session) return asToolResult({ error: "no such session" });
+      const res = await session.coverage({ durationMs, urlFilter, includeNodeInternals });
       return asToolResult(res);
     },
   );
